@@ -153,7 +153,37 @@ static_assert(sizeof(lseek(0, 0, 0)) >= 8, "64 bit file operations are required"
 
 #include "libtorrent/aux_/disable_warnings_pop.hpp"
 
+#ifndef INVALID_HANDLE_VALUE
+#define INVALID_HANDLE_VALUE (-1)
+#endif
+
 namespace libtorrent {
+
+#ifdef TORRENT_WINDOWS
+	namespace {
+		std::int64_t read(HANDLE fd, void* data, std::size_t len)
+		{
+			DWORD bytes_read = 0;
+			if (ReadFile(fd, data, DWORD(len), &bytes_read, nullptr) == FALSE)
+			{
+				return -1;
+			}
+
+			return bytes_read;
+		}
+
+		std::int64_t write(HANDLE fd, void const* data, std::size_t len)
+		{
+			DWORD bytes_written = 0;
+			if (WriteFile(fd, data, DWORD(len), &bytes_written, nullptr) == FALSE)
+			{
+				return -1;
+			}
+
+			return bytes_written;
+		}
+	}
+#endif
 
 	directory::directory(std::string const& path, error_code& ec)
 		: m_done(false)
@@ -250,53 +280,6 @@ namespace libtorrent {
 #endif
 	}
 
-#ifndef INVALID_HANDLE_VALUE
-#define INVALID_HANDLE_VALUE (-1)
-#endif
-
-#ifdef TORRENT_WINDOWS
-	struct overlapped_t
-	{
-		overlapped_t()
-		{
-			std::memset(&ol, 0, sizeof(ol));
-			ol.hEvent = CreateEvent(0, true, false, 0);
-		}
-		~overlapped_t()
-		{
-			if (ol.hEvent != INVALID_HANDLE_VALUE)
-				CloseHandle(ol.hEvent);
-		}
-		int wait(HANDLE file, error_code& ec)
-		{
-			if (ol.hEvent != INVALID_HANDLE_VALUE
-				&& WaitForSingleObject(ol.hEvent, INFINITE) == WAIT_FAILED)
-			{
-				ec.assign(GetLastError(), system_category());
-				return -1;
-			}
-
-			DWORD ret;
-			if (GetOverlappedResult(file, &ol, &ret, false) == 0)
-			{
-				DWORD last_error = GetLastError();
-				if (last_error != ERROR_HANDLE_EOF)
-				{
-#ifdef ERROR_CANT_WAIT
-					TORRENT_ASSERT(last_error != ERROR_CANT_WAIT);
-#endif
-					ec.assign(last_error, system_category());
-					return -1;
-				}
-			}
-			return ret;
-		}
-
-		OVERLAPPED ol;
-	};
-#endif // TORRENT_WINDOWS
-
-
 #ifdef TORRENT_WINDOWS
 	bool get_manage_volume_privs();
 
@@ -348,13 +331,12 @@ namespace libtorrent {
 		// turns out that it isn't. That flag will break your operating system:
 		// http://support.microsoft.com/kb/2549369
 
-		DWORD const flags = ((mode & open_mode::random_access) ? 0 : FILE_FLAG_SEQUENTIAL_SCAN)
+		DWORD const flags = ((mode & aux::open_mode::random_access) ? 0 : FILE_FLAG_SEQUENTIAL_SCAN)
 			| (a ? a : FILE_ATTRIBUTE_NORMAL)
-			| FILE_FLAG_OVERLAPPED
-			| ((mode & open_mode::no_cache) ? FILE_FLAG_WRITE_THROUGH : 0);
+			| ((mode & aux::open_mode::no_cache) ? FILE_FLAG_WRITE_THROUGH : 0);
 
 		handle_type handle = CreateFileW(file_path.c_str(), m.rw_mode
-			, (mode & open_mode::lock_file) ? FILE_SHARE_READ : FILE_SHARE_READ | FILE_SHARE_WRITE
+			, (mode & aux::open_mode::lock_files) ? FILE_SHARE_READ : FILE_SHARE_READ | FILE_SHARE_WRITE
 			, 0, m.create_mode, flags, 0);
 
 		if (handle == INVALID_HANDLE_VALUE)
@@ -372,12 +354,8 @@ namespace libtorrent {
 			&& (mode & aux::open_mode::write))
 		{
 			DWORD temp;
-			overlapped_t ol;
-			BOOL ret = ::DeviceIoControl(native_handle(), FSCTL_SET_SPARSE, 0, 0
-				, 0, 0, &temp, &ol.ol);
-			error_code error;
-			if (ret == FALSE && GetLastError() == ERROR_IO_PENDING)
-				ol.wait(native_handle(), error);
+			::DeviceIoControl(native_handle(), FSCTL_SET_SPARSE, 0, 0
+				, 0, 0, &temp, nullptr);
 		}
 #else // TORRENT_WINDOWS
 
@@ -491,9 +469,6 @@ namespace libtorrent {
 		if (!GetFileSizeEx(file, &file_size))
 			return false;
 
-		overlapped_t ol;
-		if (ol.ol.hEvent == nullptr) return false;
-
 #ifndef FSCTL_QUERY_ALLOCATED_RANGES
 typedef struct _FILE_ALLOCATED_RANGE_BUFFER {
 	LARGE_INTEGER FileOffset;
@@ -509,15 +484,9 @@ typedef struct _FILE_ALLOCATED_RANGE_BUFFER {
 
 		DWORD returned_bytes = 0;
 		BOOL ret = DeviceIoControl(file, FSCTL_QUERY_ALLOCATED_RANGES, (void*)&in, sizeof(in)
-			, out, sizeof(out), &returned_bytes, &ol.ol);
+			, out, sizeof(out), &returned_bytes, nullptr);
 
-		if (ret == FALSE && GetLastError() == ERROR_IO_PENDING)
-		{
-			error_code ec;
-			returned_bytes = ol.wait(file, ec);
-			if (ec) return true;
-		}
-		else if (ret == FALSE)
+		if (ret == FALSE)
 		{
 			return true;
 		}
@@ -540,11 +509,10 @@ typedef struct _FILE_ALLOCATED_RANGE_BUFFER {
 		// if this file is open for writing, has the sparse
 		// flag set, but there are no sparse regions, unset
 		// the flag
-		if ((m_open_mode & open_mode::write)
+		if ((m_open_mode & aux::open_mode::write)
 			&& (m_open_mode & aux::open_mode::sparse)
 			&& !is_sparse(native_handle()))
 		{
-			overlapped_t ol;
 			// according to MSDN, clearing the sparse flag of a file only
 			// works on windows vista and later
 #ifdef TORRENT_MINGW
@@ -555,13 +523,8 @@ typedef struct _FILE_ALLOCATED_RANGE_BUFFER {
 			DWORD temp;
 			FILE_SET_SPARSE_BUFFER b;
 			b.SetSparse = FALSE;
-			BOOL ret = ::DeviceIoControl(native_handle(), FSCTL_SET_SPARSE, &b, sizeof(b)
-				, 0, 0, &temp, &ol.ol);
-			error_code ec;
-			if (ret == FALSE && GetLastError() == ERROR_IO_PENDING)
-			{
-				ol.wait(native_handle(), ec);
-			}
+			::DeviceIoControl(native_handle(), FSCTL_SET_SPARSE, &b, sizeof(b)
+				, 0, 0, &temp, nullptr);
 		}
 
 		CloseHandle(native_handle());
@@ -581,9 +544,11 @@ typedef struct _FILE_ALLOCATED_RANGE_BUFFER {
 	std::int64_t iov(Fun f, handle_type fd, std::int64_t file_offset
 		, span<iovec_t const> bufs, error_code& ec)
 	{
-		int ret = 0;
+		std::int64_t ret = 0;
 
 #ifdef TORRENT_WINDOWS
+		LARGE_INTEGER offs;
+		offs.QuadPart = file_offset;
 		if (SetFilePointerEx(fd, offs, &offs, FILE_BEGIN) == FALSE)
 		{
 			ec.assign(GetLastError(), system_category());
@@ -636,7 +601,7 @@ typedef struct _FILE_ALLOCATED_RANGE_BUFFER {
 		TORRENT_ASSERT(!bufs.empty());
 		TORRENT_ASSERT(is_open());
 
-		return iov(&::read, native_handle(), file_offset, bufs, ec);
+		return iov(&read, native_handle(), file_offset, bufs, ec);
 	}
 
 	// This has to be thread safe, i.e. atomic.
@@ -660,7 +625,7 @@ typedef struct _FILE_ALLOCATED_RANGE_BUFFER {
 
 		ec.clear();
 
-		std::int64_t ret = iov(&::write, native_handle(), file_offset, bufs, ec);
+		std::int64_t ret = iov(&write, native_handle(), file_offset, bufs, ec);
 
 #if TORRENT_USE_FDATASYNC \
 	&& !defined F_NOCACHE && \
